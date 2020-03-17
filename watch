@@ -1,0 +1,93 @@
+#!/bin/bash
+
+[[ "$TRACE" ]] && set -x
+
+function usage {
+cat <<-EOF
+	Usage: $PROGNAME [OPTIONS] <local-path> <remote-path>
+	Sync s3 directory locally and backup changed files on exit
+
+	  --force-restore      restore even if local directory is not empty
+
+	   eg: $PROGNAME /data s3://bucket/dir
+EOF
+}
+
+function error_exit {
+  echo "${1:-"Unknown Error"}" 1>&2
+  exit 1
+}
+
+PARSED_OPTIONS=$(getopt -n "$0" -o f --long "force-restore" -- "$@")
+if [ $? -ne 0 ]; then
+  exit 1
+fi
+eval set -- "$PARSED_OPTIONS"
+
+while true; do
+  case "$1" in
+    -f|--force-restore)
+      FORCE_RESTORE="true"
+      shift;;
+
+    --)
+      shift
+      break;;
+  esac
+done
+
+PROGNAME=$0
+LOCAL=$1
+REMOTE=$2
+
+if [ "$ENDPOINT_URL" ]; then
+  AWS="aws --endpoint-url $ENDPOINT_URL"
+else
+  AWS=aws
+fi
+
+function restore {
+  if [ "$(ls -A $LOCAL)" ]; then
+    if [[ ${FORCE_RESTORE:false} == 'true' ]]; then
+      error_exit "local directory is not empty"
+    fi
+  fi
+
+  echo "restoring $REMOTE => $LOCAL"
+  if ! $AWS s3 sync "$REMOTE" "$LOCAL"; then
+    error_exit "restore failed"
+  fi
+}
+
+function backup {
+  echo "backup $LOCAL => $REMOTE"
+  if ! $AWS s3 sync "$LOCAL" "$REMOTE" --delete; then
+    echo "backup failed" 1>&2
+    return 1
+  fi
+}
+
+function final_backup {
+  echo "backup $LOCAL => $REMOTE"
+  while ! $AWS s3 sync "$LOCAL" "$REMOTE" --delete; do
+    echo "backup failed, will retry" 1>&2
+    sleep 1
+  done
+  exit 0
+}
+
+function idle {
+  echo "ready"
+  while true; do
+    sleep ${BACKUP_INTERVAL:-42} &
+    wait $!
+    [ -n "$BACKUP_INTERVAL" ] && backup
+  done
+}
+
+restore
+
+trap final_backup SIGHUP SIGINT SIGTERM
+trap "backup; idle" USR1
+
+idle
